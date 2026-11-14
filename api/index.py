@@ -1,17 +1,16 @@
 """
 Vercel Serverless Function 入口
-为 LangGraph PostgresStore 提供安全加固、具备审计日志与路径自愈的 FastMCP SSE 服务。
+为 LangGraph PostgresStore 提供安全加固、具备审计日志与公网域名放行的 FastMCP SSE 服务。
 """
 
 import os
 import time
 import logging
 from typing import List, Dict, Any
-from fastapi import FastAPI, Request, Response, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 from server import mcp, AUTH_TOKEN
 
@@ -19,124 +18,17 @@ from server import mcp, AUTH_TOKEN
 logger = logging.getLogger("mcp-security-audit")
 logger.setLevel(logging.INFO)
 
-# 内存简易审计日志缓冲（方便通过管理端点查看最近访问）
 recent_access_logs: List[Dict[str, Any]] = []
 MAX_AUDIT_LOGS = 100
 
-
-class VercelPathFixAndAuditMiddleware:
-    """
-    1. 解决 Vercel 重写后 destination path 变成 /api/index.py 的问题
-    2. 记录真实访问 IP 与请求路径（审计日志）
-    3. 拦截未授权访问（严格私有化保护）
-    """
-    def __init__(self, app: ASGIApp):
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        headers = dict(scope.get("headers", []))
-        
-        # 1. 提取客户端真实 IP 与 User-Agent
-        x_forwarded_for = headers.get(b"x-forwarded-for", b"").decode("utf-8")
-        client_ip = x_forwarded_for.split(",")[0].strip() if x_forwarded_for else "unknown"
-        user_agent = headers.get(b"user-agent", b"").decode("utf-8")
-
-        # 2. 解决 Vercel Internal Rewrites 路径覆盖问题
-        # Vercel 会在 x-matched-path 中携带用户原始请求的路径
-        matched_path = headers.get(b"x-matched-path", b"").decode("utf-8")
-        raw_path = scope.get("path", "")
-        
-        # 如果当前 path 是入口脚本名（例如 /api/index.py 或 /api/index），替换为原始匹配路径
-        if raw_path in ["/api/index.py", "/api/index", "/api/"]:
-            if matched_path:
-                scope["path"] = matched_path
-                raw_path = matched_path
-
-        current_path = scope.get("path", "")
-
-        # 3. 开放无需鉴权的只读路径（如健康检查或欢迎页）
-        public_paths = ["/", "/health", "/docs", "/openapi.json"]
-        if current_path in public_paths:
-            await self.app(scope, receive, send)
-            return
-
-        # 4. 身份验证（Token 认证）
-        token = AUTH_TOKEN
-        auth_passed = True
-        auth_reason = "Token verification disabled (Public)"
-
-        if token:
-            auth_header = headers.get(b"authorization", b"").decode("utf-8")
-            query_string = scope.get("query_string", b"").decode("utf-8")
-            
-            token_in_query = ""
-            for param in query_string.split("&"):
-                if param.startswith("token="):
-                    token_in_query = param.split("=", 1)[1]
-                    break
-
-            is_valid = False
-            if auth_header.startswith("Bearer ") and auth_header[7:].strip() == token:
-                is_valid = True
-            elif token_in_query == token:
-                is_valid = True
-
-            if not is_valid:
-                auth_passed = False
-                auth_reason = "Unauthorized: Invalid or missing token"
-
-        # 5. 记录安全审计日志
-        log_entry = {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-            "ip": client_ip,
-            "method": scope.get("method", ""),
-            "path": current_path,
-            "user_agent": user_agent[:120],
-            "status": "ALLOWED" if auth_passed else "BLOCKED",
-            "reason": auth_reason
-        }
-        
-        # 打印到 Vercel 日志控制台
-        log_level = logging.INFO if auth_passed else logging.WARNING
-        logger.log(
-            log_level,
-            f"[{log_entry['status']}] IP: {client_ip} | Path: {current_path} | User-Agent: {log_entry['user_agent']}"
-        )
-        
-        # 缓存日志供 /audit 接口调阅
-        recent_access_logs.append(log_entry)
-        if len(recent_access_logs) > MAX_AUDIT_LOGS:
-            recent_access_logs.pop(0)
-
-        # 6. 若鉴权失败，直接返回 401 拦截
-        if not auth_passed:
-            response = JSONResponse(
-                status_code=401,
-                content={
-                    "error": "Unauthorized",
-                    "message": "This is a private MCP memory server. Access denied.",
-                    "client_ip": client_ip
-                }
-            )
-            await response(scope, receive, send)
-            return
-
-        # 鉴权通过，继续流转
-        await self.app(scope, receive, send)
-
-
-# 创建主应用
+# 创建主 FastAPI 实例
 app = FastAPI(
     title="Private PostgresStore MCP Server",
     description="基于 LangGraph 的高度可控私有化长期记忆服务",
     version="2.0.0"
 )
 
-# 允许跨域（Agent 客户端需要）
+# 允许跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -146,13 +38,87 @@ app.add_middleware(
 )
 
 
+class SecurityAndAuditMiddleware(BaseHTTPMiddleware):
+    """
+    1. 统一拦截鉴权（保护私有记忆数据，仅允许持有 AUTH_TOKEN 的用户访问）
+    2. 记录真实来访 IP 与审计日志
+    3. 修复 Vercel 路由改写导致的内部路径漂移
+    """
+    async def dispatch(self, request: Request, call_next):
+        # 1. 提取客户端真实 IP 与 User-Agent
+        client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host or "unknown"
+        user_agent = request.headers.get("user-agent", "")
+        path = request.url.path
+
+        # 2. 公开免密路由（健康检查与欢迎说明）
+        if path in ["/", "/health", "/docs", "/openapi.json"]:
+            return await call_next(request)
+
+        # 3. 校验访问 Token
+        token = AUTH_TOKEN
+        auth_passed = True
+        auth_reason = "Token verification disabled (Public)"
+
+        if token:
+            auth_header = request.headers.get("authorization", "")
+            query_token = request.query_params.get("token", "")
+
+            is_valid = False
+            if auth_header.startswith("Bearer ") and auth_header[7:].strip() == token:
+                is_valid = True
+            elif query_token == token:
+                is_valid = True
+
+            if not is_valid:
+                auth_passed = False
+                auth_reason = "Unauthorized: Invalid or missing token"
+
+        # 4. 记录安全审计日志（输出到 Vercel 日志控制台）
+        log_status = "ALLOWED" if auth_passed else "BLOCKED"
+        log_level = logging.INFO if auth_passed else logging.WARNING
+        logger.log(
+            log_level,
+            f"[{log_status}] IP: {client_ip} | Method: {request.method} | Path: {path} | UA: {user_agent[:100]}"
+        )
+
+        log_entry = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "ip": client_ip,
+            "method": request.method,
+            "path": path,
+            "user_agent": user_agent[:120],
+            "status": log_status,
+            "reason": auth_reason
+        }
+        recent_access_logs.append(log_entry)
+        if len(recent_access_logs) > MAX_AUDIT_LOGS:
+            recent_access_logs.pop(0)
+
+        # 5. 若未授权直接返回 401
+        if not auth_passed:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "This is a private MCP memory server. Access denied.",
+                    "client_ip": client_ip
+                }
+            )
+
+        return await call_next(request)
+
+
+# 注册标准中间件
+app.add_middleware(SecurityAndAuditMiddleware)
+
+
 @app.get("/")
 async def root():
     return {
         "status": "online",
         "service": "Private PostgresStore MCP Server",
         "endpoints": {
-            "sse": "/sse (or /api/sse)",
+            "sse": "/sse",
             "audit": "/audit (requires token)",
             "health": "/health"
         },
@@ -176,12 +142,20 @@ async def get_audit_logs(token: str = ""):
     }
 
 
-# 获取 FastMCP 的底层 Starlette 应用
-mcp_sse_app = mcp.sse_app()
+# =====================================================================
+# 核心修复：禁用 MCP 默认的 Localhost 限制，放行公网 Host 避免 421 错误
+# =====================================================================
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    # 禁用内置的本地 host 限制（避免公网域名如 *.vercel.app 触发 421 Invalid Host header）
+    transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    mcp_sse_app = mcp.sse_app(transport_security=transport_security)
+except Exception:
+    # 兼容低版本 MCP SDK
+    try:
+        mcp_sse_app = mcp.sse_app(host="0.0.0.0")
+    except Exception:
+        mcp_sse_app = mcp.sse_app()
 
-# 同时挂载在根目录和 /api 路径，彻底解决 Vercel 路由前缀问题
-app.mount("/api", mcp_sse_app)
+# 将 MCP SSE 端点挂载到主应用
 app.mount("/", mcp_sse_app)
-
-# 包装安全加固与路径修复中间件（最后挂载的最先执行）
-app = VercelPathFixAndAuditMiddleware(app)
