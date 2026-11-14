@@ -1,6 +1,6 @@
 """
 Vercel Serverless Function 入口
-为 LangGraph PostgresStore 提供安全加固、具备审计日志与公网域名放行的 FastMCP SSE 服务。
+为 LangGraph PostgresStore 提供安全加固、具备审计日志与公网域名放行的 FastMCP SSE & Streamable HTTP 服务。
 """
 
 import os
@@ -119,6 +119,7 @@ async def root():
         "service": "Private PostgresStore MCP Server",
         "endpoints": {
             "sse": "/sse",
+            "streamable_http": "/mcp",
             "audit": "/audit (requires token)",
             "health": "/health"
         },
@@ -144,14 +145,15 @@ async def get_audit_logs(token: str = ""):
 
 # =====================================================================
 # 核心修复：禁用 MCP 默认的 Localhost 限制，放行公网 Host 避免 421 错误
+# 同时挂载 SSE 端点与 Streamable HTTP 端点
 # =====================================================================
 try:
     from mcp.server.transport_security import TransportSecuritySettings
-    # 禁用内置的本地 host 限制（避免公网域名如 *.vercel.app 触发 421 Invalid Host header）
     transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     mcp_sse_app = mcp.sse_app(transport_security=transport_security)
+    mcp_stream_app = mcp.streamable_http_app(transport_security=transport_security)
+    app.mount("/mcp", mcp_stream_app)
 except Exception:
-    # 兼容低版本 MCP SDK
     try:
         mcp_sse_app = mcp.sse_app(host="0.0.0.0")
     except Exception:
