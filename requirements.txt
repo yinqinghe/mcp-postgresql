@@ -1,8 +1,12 @@
 # requirements.txt
-mcp>=1.2.0
-fastapi>=0.115.0
-uvicorn>=0.30.0
+# 支持 MCP 1.x 及最新的 2.x
+mcp>=1.3.0
+langgraph>=0.2.0
 langgraph-checkpoint-postgres>=2.0.0
 psycopg[binary,pool]>=3.2.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
 python-dotenv>=1.0.0
 pydantic>=2.0.0
+sse-starlette>=2.0.0
+starlette>=0.38.0

@@ -1,25 +1,44 @@
 # PostgresStore MCP Server (高可控私有化长期记忆服务)
 
-本项目基于 **LangGraph 的 `PostgresStore`** 和 **MCP (Model Context Protocol)** 协议，构建了一个完全私有化、高度可控的外接长期记忆服务。
+本项目基于 **LangGraph 的 `PostgresStore`** 和 **MCP (Model Context Protocol)** 协议，构建了一个完全私有化、零信任鉴权、高度可控的外接长期记忆服务。
 
 可部署于 **Vercel**（基于 HTTP-SSE 协议提供无状态 Serverless 端点），也可在本地以 **stdio** 或本地 HTTP 模式运行，直接接入 **Google Antigravity**、Cursor、Claude Desktop 或任何支持 MCP 的智能体（Agent）。
 
 ---
 
-## 🌟 特性
+## 🔒 独占访问与安全防护（仅自己可用）
 
-1. **完全私有化 & 自主掌控**：数据直存于您的 PostgreSQL（支持 Neon, Supabase, 阿里云 RDS 或自建 PostgreSQL），杜绝第三方数据泄露风险。
-2. **LangGraph Store 原生兼容**：底层基于 `langgraph.store.postgres.AsyncPostgresStore`，与 LangGraph 生态完全统一，支持层级分类 (`namespace`)、键值存储与全文检索。
-3. **适配 Serverless 环境 (Vercel)**：采用异步连接池 (`psycopg_pool`) 与短连接优化，提供标准的 MCP SSE 端点 `/sse` 与 `/messages`。
-4. **双模运行**：
-   - **本地 stdio 模式**：无需公网暴露，本地客户端直接拉起 Python 进程。
-   - **HTTP-SSE 模式**：部署在 Vercel 或轻量容器中，支持可选的 `AUTH_TOKEN` 鉴权。
-5. **为 Agent 长期记忆量身定制的工具集**：
-   - `save_memory`: 存储/更新记忆
-   - `get_memory`: 读取指定记忆
-   - `search_memory`: 关键字或前缀检索相关记忆
-   - `delete_memory`: 遗忘/清理记忆
-   - `list_memory_namespaces`: 查看记忆分类树
+当部署到公网 Vercel 时，为了防止他人探测、盗刷或篡改数据库中的记忆，内置了**零信任安全鉴权机制**：
+
+1. **Token 强制认证**：
+   - 在 Vercel 环境变量中配置 `AUTH_TOKEN`（例如一个高强度的随机密钥）。
+   - 所有对记忆工具的访问（包括 `/sse` 握手和 `/messages` 消息通道）均受到拦截检查。
+   - 任何未携带或携带错误 Token 的请求，均会被直接拦截并返回 `401 Unauthorized`，不会接触任何数据库。
+2. **双通道鉴权支持**：
+   - **Header 认证**：`Authorization: Bearer <AUTH_TOKEN>`（适用于支持自定义 HTTP 头的客户端）。
+   - **URL Query 认证**：`https://your-domain.vercel.app/sse?token=<AUTH_TOKEN>`（适用于仅支持在 URL 中传参的 SSE 客户端）。
+3. **实时访问监控与审计日志 (Audit Logs)**：
+   - 记录每一次请求的 **时间戳、真实客户端 IP、请求路径、User-Agent 以及认证结果 (`ALLOWED` / `BLOCKED`)**。
+   - **在 Vercel 控制台查看**：在 Vercel 的 **Project -> Logs** 页面可实时查阅所有访问与非法探测记录。
+   - **专属审计接口**：管理员可直接请求 `GET /audit?token=<AUTH_TOKEN>` 查看最近 100 次的访问记录。
+
+---
+
+## 🛠️ 故障排查与修复说明 (Vercel 部署)
+
+### 1. `WARNING! Internal rewrites...` 警告修复
+- **原因**：Vercel 最新版本的路由机制中，使用 `rewrites` 将所有路径重写到 `/api/index.py` 时，后端框架接收到的内部路径会被覆盖为 destination（即 `/api/index.py`），导致无法匹配 `/sse`。
+- **解决**：改用 `routes` 配置，并在 `api/index.py` 中内置了 ASGI 路径自愈中间件，自动提取请求头中的原始路径（`x-matched-path`），同时将 MCP 应用并行挂载在 `/` 与 `/api`，确保无论何种路由形式均可 100% 正确命中。
+
+### 2. HTTP 500 (Non-200 status code) 修复
+- **原因**：
+  1. `mcp` 升级到 2.x 后内部模块重构，直接引用 `FastMCP` 会导致 `ModuleNotFoundError`。
+  2. 依赖项中缺少 `langgraph` 主包。
+  3. 数据库连接串未配置或异常时在顶层模块抛出异常导致进程崩溃。
+- **解决**：
+  1. 增加了 `MCPServer` (2.x) 与 `FastMCP` (1.x) 的无缝向下兼容层。
+  2. 补齐 `requirements.txt`。
+  3. 数据库连接改为**惰性延迟初始化**与优雅容错，即使数据库短暂波动也不会导致整个服务直接 Crash 500。
 
 ---
 
@@ -28,69 +47,25 @@
 ```text
 mcp-PostgreSQL/
 ├── api/
-│   └── index.py            # Vercel Serverless 入口 (FastAPI + FastMCP SSE)
-├── server.py               # 核心 MCP 工具与 PostgresStore 连接逻辑
+│   └── index.py            # Vercel Serverless 入口 (FastAPI + SSE + 安全拦截与审计)
+├── server.py               # 核心 MCP 工具与 PostgresStore 连接逻辑 (支持 MCP 1.x & 2.x)
 ├── requirements.txt        # 依赖清单
-├── vercel.json             # Vercel 路由配置
+├── vercel.json             # Vercel 路由配置 (消除 rewrites warning)
 ├── .env.example            # 环境变量配置模版
 └── README.md               # 详细文档
 ```
 
 ---
 
-## 🚀 快速开始
-
-### 1. 本地安装与准备
-
-推荐使用 Python 3.10+：
-
-```bash
-# 克隆或进入项目目录
-cd mcp-PostgreSQL
-
-# 安装依赖
-pip install -r requirements.txt
-
-# 配置环境变量
-copy .env.example .env
-```
-
-在 `.env` 中填入你的 PostgreSQL 连接串：
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/dbname?sslmode=disable
-AUTH_TOKEN=my_secret_token
-```
-
-> **提示**：PostgresStore 会在首次启动时自动调用 `store.setup()` 创建所需的表结构（`store` 表及索引），无需手动建表。
-
-### 2. 本地测试运行
-
-- **以 stdio 模式启动（供本地 Agent CLI 或 IDE 管道连接）**：
-  ```bash
-  python server.py stdio
-  ```
-
-- **以 SSE 模式启动（本地 HTTP 服务）**：
-  ```bash
-  python server.py sse
-  ```
-  服务默认运行在 `http://localhost:8000/sse`。
-
----
-
-## ☁️ 部署到 Vercel
+## 🚀 部署到 Vercel 步骤
 
 1. 将代码推送到 GitHub 私有仓库。
 2. 在 [Vercel Dashboard](https://vercel.com/) 中点击 **"Add New Project"** 并导入该仓库。
 3. 在 Vercel 项目的 **Settings -> Environment Variables** 中添加：
-   - `DATABASE_URL`：PostgreSQL 连接串。
-     - *若使用 Supabase/Neon*，推荐使用带连接池的连接串（Transaction Pooler，Supabase 端口通常为 6543）。
-   - `AUTH_TOKEN`：访问秘钥（用于保护公网接口）。
-   - `DB_POOL_MAX`：建议设置为 `3` 或 `5`，避免 Serverless 多实例占满数据库连接。
-4. 点击 **Deploy**。部署完成后你将获得一个域名，例如：`https://your-mcp-memory.vercel.app`。
-5. MCP SSE 端点地址为：
-   `https://your-mcp-memory.vercel.app/sse`
-   （若配置了 `AUTH_TOKEN`，可在 Query 中附带：`https://your-mcp-memory.vercel.app/sse?token=my_secret_token`）
+   - `DATABASE_URL`：PostgreSQL 连接串（推荐使用 Neon 或 Supabase 的连接池串）。
+   - `AUTH_TOKEN`：**必填**，你的专属私钥（例如 `my_super_secret_key_123`）。
+   - `DB_POOL_MAX`：建议设置为 `3` 或 `4`。
+4. 点击 **Deploy**。
 
 ---
 
@@ -98,17 +73,29 @@ AUTH_TOKEN=my_secret_token
 
 ### 1. 接入 Google Antigravity
 
-在 Antigravity 的用户配置或工作区 MCP 配置中（如 `mcp_servers` 配置）添加：
+在 Antigravity 的用户/工作区配置中（如 `settings.json` 或 MCP 扩展设置）添加：
 
-#### 方案 A：远程 Vercel 部署 (SSE)
+#### 方案 A：远程 Vercel 部署 (SSE) - 推荐
+如果客户端支持自定义 Headers：
 ```json
 {
   "mcpServers": {
     "postgres-memory": {
-      "url": "https://your-mcp-memory.vercel.app/sse",
+      "url": "https://your-domain.vercel.app/sse",
       "headers": {
-        "Authorization": "Bearer my_secret_token"
+        "Authorization": "Bearer my_super_secret_key_123"
       }
+    }
+  }
+}
+```
+
+如果客户端不支持自定义 Headers，可以直接在 URL 中携带：
+```json
+{
+  "mcpServers": {
+    "postgres-memory": {
+      "url": "https://your-domain.vercel.app/sse?token=my_super_secret_key_123"
     }
   }
 }
@@ -129,38 +116,12 @@ AUTH_TOKEN=my_secret_token
 }
 ```
 
-### 2. 接入 Cursor / Claude Desktop
-
-在 `claude_desktop_config.json` 或 Cursor MCP 设置中配置：
-
-```json
-{
-  "mcpServers": {
-    "postgres_memory": {
-      "command": "python",
-      "args": ["<绝对路径>/server.py", "stdio"],
-      "env": {
-        "DATABASE_URL": "postgresql://..."
-      }
-    }
-  }
-}
-```
-
 ---
 
-## 🧠 长期记忆管理最佳实践 (Prompt 建议)
+## 🧠 记忆管理常用工具
 
-为了让 Agent 更智能地使用此 MCP 服务，你可以在 Agent 的 System Prompt 或 Instructions 中加入如下指引：
-
-```markdown
-你有权使用 `postgres-memory` 工具来维护和读取长期记忆：
-1. **记忆分类（Namespace 约定）**：
-   - 用户画像与偏好：`["user", "profile"]`
-   - 项目规范与约束：`["projects", "<project_name>", "rules"]`
-   - 经验与教训（Tips）：`["knowledge", "solutions"]`
-2. **检索时机**：
-   - 遇到新任务时，先使用 `search_memory` 或 `get_memory` 查询是否有过往经验、用户特定偏好或规范。
-3. **更新时机**：
-   - 当用户纠正了错误、声明了长期有效的个人偏好、或达成重要技术决策时，使用 `save_memory` 主动归档。
-```
+- `save_memory(namespace, key, value)`: 保存或更新结构化记忆
+- `get_memory(namespace, key)`: 读取指定记忆
+- `search_memory(namespace_prefix, query, limit)`: 检索记忆（支持关键词检索）
+- `delete_memory(namespace, key)`: 删除/遗忘记忆
+- `list_memory_namespaces(prefix, limit)`: 查看所有记忆分类目录
