@@ -6,6 +6,7 @@ PostgresStore MCP Server (纯文本/全文检索 - Token 极致优化版)
 """
 
 import os
+import re
 import logging
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
@@ -78,11 +79,11 @@ mcp = MCPServer("postgres-memory-store")
 
 @mcp.tool()
 async def save_memory(
-    ns: List[str],
     key: str,
-    content: str
+    content: str,
+    ns: List[str] = []
 ) -> str:
-    """Save long-term memory. ns: path tags like ['user', 'pref']; key: item name; content: text."""
+    """Save long-term memory. key: item name; content: text; ns: optional path tags (default [])."""
     try:
         store = await get_store()
         await store.aput(tuple(ns), key, {"content": content, "text": content})
@@ -94,18 +95,45 @@ async def save_memory(
 
 @mcp.tool()
 async def search_memory(
-    ns: List[str],
+    ns: List[str] = [],
     query: Optional[str] = None,
     limit: int = 3
 ) -> List[Dict[str, str]]:
-    """Search memories by keyword query or prefix. Default limit 3 to save tokens."""
+    """Search memories. Pass ns=[] for root. Supports multi-keyword fallback."""
     try:
         store = await get_store()
         clamped_limit = min(max(1, limit), 5)
-        items = await store.asearch(tuple(ns), query=query, limit=clamped_limit)
+        target_ns = tuple(ns) if ns else ()
 
+        # 纯文本模式下 LangGraph SQL 原生忽略 query，先拉取候选集在内存中做多词容错检索
+        fetch_limit = 20 if query else clamped_limit
+        items = await store.asearch(target_ns, query=query, limit=fetch_limit)
+
+        # 容错降级 1：若指定了子命名空间 (如 ['user']) 未查到，自动回退到根命名空间 ()
+        if not items and target_ns != ():
+            items = await store.asearch((), query=query, limit=fetch_limit)
+
+        # 容错降级 2：纯文本检索关键词匹配 (解决长词/多词 AND 冲突)
+        if query and items:
+            kws = [w.lower() for w in re.split(r'[\s,，;；、]+', query.strip()) if len(w.strip()) > 0]
+            if kws:
+                scored = []
+                for it in items:
+                    val = it.value.get("content") or it.value.get("text") or str(it.value)
+                    k_lower = it.key.lower()
+                    v_lower = str(val).lower()
+                    score = sum(3 for w in kws if w in k_lower) + sum(1 for w in kws if w in v_lower)
+                    if score > 0:
+                        scored.append((score, it, val))
+                if scored:
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    return [{"k": it.key, "v": val} for _, it, val in scored[:clamped_limit]]
+                else:
+                    return []
+
+        # 无 query 或未开启分词过滤时直接返回前 clamped_limit 条
         results = []
-        for it in items:
+        for it in items[:clamped_limit]:
             val = it.value.get("content") or it.value.get("text") or str(it.value)
             results.append({"k": it.key, "v": val})
         return results
@@ -116,13 +144,17 @@ async def search_memory(
 
 @mcp.tool()
 async def get_memory(
-    ns: List[str],
-    key: str
+    key: str,
+    ns: List[str] = []
 ) -> Optional[str]:
     """Get single memory by exact key. Returns content text only."""
     try:
         store = await get_store()
-        item = await store.aget(tuple(ns), key)
+        target_ns = tuple(ns) if ns else ()
+        item = await store.aget(target_ns, key)
+        # 容错降级：若在指定子命名空间未查到，回退到根命名空间查
+        if not item and target_ns != ():
+            item = await store.aget((), key)
         if not item:
             return None
         return item.value.get("content") or item.value.get("text") or str(item.value)
@@ -133,13 +165,19 @@ async def get_memory(
 
 @mcp.tool()
 async def delete_memory(
-    ns: List[str],
-    key: str
+    key: str,
+    ns: List[str] = []
 ) -> str:
     """Delete a memory item."""
     try:
         store = await get_store()
-        await store.adelete(tuple(ns), key)
+        target_ns = tuple(ns) if ns else ()
+        await store.adelete(target_ns, key)
+        if target_ns != ():
+            try:
+                await store.adelete((), key)
+            except Exception:
+                pass
         return f"OK: deleted '{key}'"
     except Exception as e:
         logger.error(f"delete_memory failed: {e}")
